@@ -2,94 +2,141 @@ import streamlit as st
 import os
 import time
 import glob
-import os
 from gtts import gTTS
 from PIL import Image
 import base64
+from pydub import AudioSegment
+from io import BytesIO
+from googletrans import Translator
+from docx import Document
+from PyPDF2 import PdfReader
+# ElevenLabs stub (uncomment and install elevenlabs-sdk)
+# from elevenlabs import generate, set_api_key
 
-st.title("Conversión de Texto a Audio")
+# Config
+st.set_page_config(page_title="Texto a Audio Mejorado", layout="wide")
+
+# Sidebar
+st.sidebar.title("Opciones de Entrada")
+input_mode = st.sidebar.selectbox("Modo de entrada", ["Texto manual", "Cargar archivo"])
+
+# Load image
 image = Image.open('gato_raton.png')
 st.image(image, width=350)
-with st.sidebar:
-    st.subheader("Esrcibe y/o selecciona texto para ser escuchado.")
 
+# Input text
+if input_mode == "Texto manual":
+    text = st.text_area("Ingrese el texto a convertir", height=200)
+else:
+    uploaded = st.sidebar.file_uploader("Sube .txt, .pdf o .docx", type=["txt", "pdf", "docx"])
+    text = ""
+    if uploaded:
+        if uploaded.type == "text/plain":
+            text = uploaded.read().decode('utf-8')
+        elif uploaded.type == "application/pdf":
+            reader = PdfReader(uploaded)
+            text = "".join(page.extract_text() for page in reader.pages)
+        elif uploaded.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            doc = Document(uploaded)
+            text = "".join(p.text for p in doc.paragraphs)
 
+st.subheader("Texto a reproducir:")
+st.write(text)
+
+# Translation option
+translate = st.sidebar.checkbox("Traducir antes de convertir")
+if translate:
+    target_lang = st.sidebar.selectbox("Idioma destino", ["es", "en", "fr", "de"])
+    translator = Translator()
+    text = translator.translate(text, dest=target_lang).text
+    st.info(f"Texto traducido a {target_lang}")
+
+# Engine selection
+tts_engine = st.sidebar.selectbox("Motor TTS", ["gTTS", "ElevenLabs"])
+
+# Voice controls
+st.sidebar.subheader("Controles de voz")
+speed = st.sidebar.slider("Velocidad (1.0 = normal)", 0.5, 2.0, 1.0)
+pitch = st.sidebar.slider("Pitch (0.5 = bajo)", 0.5, 2.0, 1.0)
+
+# Fragment selection
+st.sidebar.subheader("Fragmento de texto")
+start_idx = st.sidebar.number_input("Inicio (carácter)", 0, max(0, len(text)-1), 0)
+end_idx = st.sidebar.number_input("Fin (carácter)", start_idx+1, len(text), len(text))
+frag = text[start_idx:end_idx]
+
+# Cache decorator for audio generation
+@st.cache_data
+def generate_audio(text, engine, speed, pitch):
+    # generate mp3 bytes and length
+    if engine == "gTTS":
+        tts = gTTS(text, lang='es' if ' ' not in text else 'en', slow=False)
+        buffer = BytesIO()
+        tts.write_to_fp(buffer)
+        buffer.seek(0)
+        audio = AudioSegment.from_file(buffer, format="mp3")
+    else:
+        # ElevenLabs example
+        # set_api_key(os.getenv('ELEVEN_API_KEY'))
+        # audio_bytes = generate(text=text, voice="Rachel", model="eleven_multilingual_v1")
+        # audio = AudioSegment.from_file(BytesIO(audio_bytes), format="mp3")
+        st.warning("ElevenLabs no configurado, usando gTTS como fallback.")
+        tts = gTTS(text, lang='es', slow=False)
+        buffer = BytesIO()
+        tts.write_to_fp(buffer)
+        buffer.seek(0)
+        audio = AudioSegment.from_file(buffer, format="mp3")
+    # apply speed
+    audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * speed)})
+    audio = audio.set_frame_rate(audio.frame_rate)
+    # pitch shift approximation via speed change (simplified)
+    audio = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * pitch)})
+    audio = audio.set_frame_rate(audio.frame_rate)
+    return audio
+
+if st.button("Convertir a Audio"):
+    if not frag:
+        st.error("Texto vacío.")
+    else:
+        audio = generate_audio(frag, tts_engine, speed, pitch)
+        # export options
+        fmt = st.selectbox("Formato de salida", ["mp3", "wav", "ogg"])
+        buf = BytesIO()
+        audio.export(buf, format=fmt)
+        buf.seek(0)
+        st.audio(buf.read(), format=f"audio/{fmt}")
+        # Download link
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        href = f'<a href="data:audio/{fmt};base64,{b64}" download="audio.{fmt}">Descargar {fmt.upper()}</a>'
+        st.markdown(href, unsafe_allow_html=True)
+        # Generate subtitles SRT approx
+        words = frag.split()
+        total_ms = len(audio)
+        per_word = total_ms / len(words)
+        srt = ""
+        cum = 0
+        for i, w in enumerate(words, 1):
+            start = cum
+            end = cum + per_word
+            def ms_to_srt(ms):
+                h = int(ms // 3600000)
+                m = int((ms % 3600000) // 60000)
+                s = int((ms % 60000) // 1000)
+                ms_rem = int(ms % 1000)
+                return f"{h:02}:{m:02}:{s:02},{ms_rem:03}"
+            srt += f"{i}\n{ms_to_srt(start)} --> {ms_to_srt(end)}\n{w}\n\n"
+            cum = end
+        st.download_button("Descargar SRT", srt, file_name="subtitles.srt", mime="text/plain")
+
+# Cleanup older files in temp
 try:
     os.mkdir("temp")
 except:
     pass
 
-st.subheader("Una pequeña Fábula.")
-st.write('¡Ay! -dijo el ratón-. El mundo se hace cada día más pequeño. Al principio era tan grande que le tenía miedo. '  
-         ' Corría y corría y por cierto que me alegraba ver esos muros, a diestra y siniestra, en la distancia. ' 
-         ' Pero esas paredes se estrechan tan rápido que me encuentro en el último cuarto y ahí en el rincón está '  
-         ' la trampa sobre la cual debo pasar. Todo lo que debes hacer es cambiar de rumbo dijo el gato...y se lo comió. ' 
-         '  '
-         ' Franz Kafka.'
-        
-        )
-           
-st.markdown(f"Quieres escucharlo?, copia el texto")
-text = st.text_area("Ingrese El texto a escuchar.")
-
-tld='com'
-option_lang = st.selectbox(
-    "Selecciona el lenguaje",
-    ("Español", "English"))
-if option_lang=="Español" :
-    lg='es'
-if option_lang=="English" :
-    lg='en'
-
-def text_to_speech(text, tld,lg):
-    
-    tts = gTTS(text,lang=lg) # tts = gTTS(text,'en', tld, slow=False)
-    try:
-        my_file_name = text[0:20]
-    except:
-        my_file_name = "audio"
-    tts.save(f"temp/{my_file_name}.mp3")
-    return my_file_name, text
-
-
-#display_output_text = st.checkbox("Verifica el texto")
-
-if st.button("convertir a Audio"):
-     result, output_text = text_to_speech(text, 'com',lg)#'tld
-     audio_file = open(f"temp/{result}.mp3", "rb")
-     audio_bytes = audio_file.read()
-     st.markdown(f"## Tú audio:")
-     st.audio(audio_bytes, format="audio/mp3", start_time=0)
-
-     #if display_output_text:
-     
-     #st.write(f" {output_text}")
-    
-#if st.button("ElevenLAabs",key=2):
-#     from elevenlabs import play
-#     from elevenlabs.client import ElevenLabs
-#     client = ElevenLabs(api_key="a71bb432d643bbf80986c0cf0970d91a", # Defaults to ELEVEN_API_KEY)
-#     audio = client.generate(text=f" {output_text}",voice="Rachel",model="eleven_multilingual_v1")
-#     audio_file = open(f"temp/{audio}.mp3", "rb")
-
-     with open(f"temp/{result}.mp3", "rb") as f:
-         data = f.read()
-
-     def get_binary_file_downloader_html(bin_file, file_label='File'):
-        bin_str = base64.b64encode(data).decode()
-        href = f'<a href="data:application/octet-stream;base64,{bin_str}" download="{os.path.basename(bin_file)}">Download {file_label}</a>'
-        return href
-     st.markdown(get_binary_file_downloader_html("audio.mp3", file_label="Audio File"), unsafe_allow_html=True)
-
-def remove_files(n):
-    mp3_files = glob.glob("temp/*mp3")
-    if len(mp3_files) != 0:
-        now = time.time()
-        n_days = n * 86400
-        for f in mp3_files:
-            if os.stat(f).st_mtime < now - n_days:
-                os.remove(f)
-                print("Deleted ", f)
-
-
-remove_files(7)
+def cleanup(days=7):
+    now = time.time()
+    for f in glob.glob("temp/*"):
+        if os.stat(f).st_mtime < now - days*86400:
+            os.remove(f)
+cleanup(7)
